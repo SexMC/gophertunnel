@@ -9,6 +9,14 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/google/uuid"
@@ -19,13 +27,6 @@ import (
 	"github.com/sandertv/gophertunnel/minecraft/protocol/packet"
 	"github.com/sandertv/gophertunnel/minecraft/resource"
 	"github.com/sandertv/gophertunnel/minecraft/text"
-	"io"
-	"log/slog"
-	"net"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 // exemptedResourcePack is a resource pack that is exempted from being downloaded. These packs may be directly
@@ -349,6 +350,45 @@ func (conn *Conn) WritePacket(pk packet.Packet) error {
 	return nil
 }
 
+// WritePacketsUnbuffered encodes a batch of packets passed and writes it to the Conn.
+func (conn *Conn) WritePacketsUnbuffered(pks []packet.Packet) error {
+	select {
+	case <-conn.ctx.Done():
+		return conn.closeErr("write packet")
+	default:
+	}
+	conn.sendMu.Lock()
+	defer conn.sendMu.Unlock()
+
+	buf := internal.BufferPool.Get().(*bytes.Buffer)
+	defer func() {
+		// Reset the buffer, so we can return it to the buffer pool safely.
+		buf.Reset()
+		internal.BufferPool.Put(buf)
+	}()
+
+	for _, pk := range pks {
+		conn.hdr.PacketID = pk.ID()
+		_ = conn.hdr.Write(buf)
+		l := buf.Len()
+
+		for _, converted := range conn.proto.ConvertFromLatest(pk, conn) {
+			converted.Marshal(conn.proto.NewWriter(buf, conn.shieldID.Load()))
+
+			if conn.packetFunc != nil {
+				conn.packetFunc(*conn.hdr, buf.Bytes()[l:], conn.LocalAddr(), conn.RemoteAddr())
+			}
+
+			packets := [][]byte{append([]byte(nil), buf.Bytes()...)}
+			if err := conn.enc.Encode(packets); err != nil && !errors.Is(err, net.ErrClosed) {
+				// Should never happen.
+				panic(fmt.Errorf("error encoding packet batch: %w", err))
+			}
+		}
+	}
+	return nil
+}
+
 // ReadPacket reads a packet from the Conn, depending on the packet ID that is found in front of the packet
 // data. If a read deadline is set, an error is returned if the deadline is reached before any packet is
 // received. ReadPacket must not be called on multiple goroutines simultaneously.
@@ -409,6 +449,18 @@ func (conn *Conn) Write(b []byte) (n int, err error) {
 	defer conn.sendMu.Unlock()
 
 	conn.bufferedSend = append(conn.bufferedSend, b)
+	return len(b), nil
+}
+
+// WriteUnbuffered writes a batch of serialised packet data to the Conn.
+func (conn *Conn) WriteUnbuffered(b [][]byte) (n int, err error) {
+	conn.sendMu.Lock()
+	defer conn.sendMu.Unlock()
+
+	if err := conn.enc.Encode(b); err != nil && !errors.Is(err, net.ErrClosed) {
+		// Should never happen.
+		panic(fmt.Errorf("error encoding packet batch: %w", err))
+	}
 	return len(b), nil
 }
 
